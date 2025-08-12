@@ -1,22 +1,26 @@
 """
-Music Commands Cog
-Handles all music recommendation functionality converted from Telegram bot.
+Optimized Music Commands Cog
+Handles all music recommendation functionality with enhanced performance and error handling.
 """
 
 import discord
 from discord.ext import commands
 import logging
 import time
-from typing import List
+import asyncio
+from typing import List, Optional
 from datetime import datetime
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
 class MusicCommands(commands.Cog):
-    """Music recommendation commands and message handling."""
+    """Music recommendation commands and message handling with performance optimization."""
     
     def __init__(self, bot):
         self.bot = bot
+        self.user_cooldowns = defaultdict(float)
+        self.processing_users = set()
     
     @commands.command(name='start')
     async def start_command(self, ctx):
@@ -69,6 +73,9 @@ class MusicCommands(commands.Cog):
         
         await ctx.send(embed=welcome_embed)
         logger.info(f"User {ctx.author.id} started the bot")
+        
+        # Update metrics
+        self.bot.performance_metrics['total_requests'] += 1
     
     @commands.command(name='help')
     async def help_command(self, ctx):
@@ -122,7 +129,7 @@ class MusicCommands(commands.Cog):
         """Handle !stats command to show user statistics."""
         user_id = ctx.author.id
         requests_made = self.bot.user_stats[user_id]
-        remaining = self.bot.rate_limiter.get_remaining(user_id)
+        user_stats = await self.bot.rate_limiter.get_user_stats(user_id)
         
         stats_embed = discord.Embed(
             title="📊 Your Usage Statistics",
@@ -130,36 +137,53 @@ class MusicCommands(commands.Cog):
         )
         
         stats_embed.add_field(
-            name="Requests made",
+            name="Total Requests Made",
             value=str(requests_made),
             inline=True
         )
         
         stats_embed.add_field(
-            name="Remaining this minute",
-            value=f"{remaining}/15",
+            name="Requests This Minute",
+            value=f"{user_stats['requests_in_window']}/15",
             inline=True
         )
         
         stats_embed.add_field(
-            name="Rate limit",
-            value="15 requests per minute",
+            name="Remaining Requests",
+            value=f"{user_stats['remaining_requests']}/15",
             inline=True
         )
         
         stats_embed.add_field(
-            name="Reset time",
-            value="Every minute",
+            name="Rate Limit Status",
+            value="🟢 Active" if not user_stats['is_rate_limited'] else "🔴 Limited",
+            inline=True
+        )
+        
+        stats_embed.add_field(
+            name="Reset Time",
+            value=f"<t:{int(user_stats['window_reset_time'])}:R>",
+            inline=True
+        )
+        
+        # Add performance metrics
+        avg_response_time = self.bot.performance_metrics.get('avg_response_time', 0)
+        stats_embed.add_field(
+            name="Average Response Time",
+            value=f"{avg_response_time:.2f}s",
             inline=True
         )
         
         stats_embed.set_footer(text="Keep enjoying your music! 🎶")
         
+        # Update metrics
+        self.bot.performance_metrics['total_requests'] += 1
+        
         await ctx.send(embed=stats_embed)
     
     @commands.Cog.listener()
     async def on_message(self, message):
-        """Handle incoming messages with rate limiting and enhanced processing."""
+        """Handle incoming messages with optimized rate limiting and processing."""
         # Ignore bot messages and commands
         if message.author.bot or message.content.startswith('!'):
             return
@@ -167,27 +191,48 @@ class MusicCommands(commands.Cog):
         user_message = message.content
         user_id = message.author.id
         
+        # Prevent duplicate processing
+        if user_id in self.processing_users:
+            return
+        
+        # Check cooldown
+        current_time = time.time()
+        if current_time - self.user_cooldowns[user_id] < 2:  # 2 second cooldown
+            return
+        
         logger.info(f"Received message from user {user_id}: {user_message}")
         
-        # Check rate limiting
-        if not self.bot.rate_limiter.is_allowed(user_id):
-            remaining_time = 60 - int(time.time() % 60)
+        # Check rate limiting with async method
+        if not await self.bot.rate_limiter.is_allowed(user_id):
+            user_stats = await self.bot.rate_limiter.get_user_stats(user_id)
+            remaining_time = int(user_stats['window_reset_time'] - current_time)
+            
             rate_limit_embed = discord.Embed(
                 title="⏰ Rate Limit Exceeded!",
                 description=f"Please wait {remaining_time} seconds before making another request.\n\n"
-                           f"Limit: 15 requests per minute",
+                           f"Limit: 15 requests per minute\n"
+                           f"Your requests: {user_stats['requests_in_window']}/15",
                 color=discord.Color.red()
             )
             await message.reply(embed=rate_limit_embed)
             return
         
+        # Mark user as processing
+        self.processing_users.add(user_id)
+        self.user_cooldowns[user_id] = current_time
+        
         # Send typing indicator
         async with message.channel.typing():
+            start_time = time.time()
             try:
+                # Update metrics
+                self.bot.performance_metrics['total_requests'] += 1
+                
                 # Extract keywords using OpenRouter
                 keywords = await self.bot.openrouter_api.extract_music_keywords(user_message)
                 
                 if not keywords:
+                    self.bot.performance_metrics['cache_misses'] += 1
                     no_keywords_embed = discord.Embed(
                         title="🤔 I couldn't understand what kind of music you're looking for.",
                         description="**Try being more specific:**\n"
@@ -205,6 +250,7 @@ class MusicCommands(commands.Cog):
                 tracks = await self.bot.spotify_api.get_recommendations(keywords)
                 
                 if not tracks:
+                    self.bot.performance_metrics['cache_misses'] += 1
                     no_tracks_embed = discord.Embed(
                         title="😔 Sorry, I couldn't find any music recommendations based on your request.",
                         description="**Try these suggestions:**\n"
@@ -216,16 +262,26 @@ class MusicCommands(commands.Cog):
                     await message.reply(embed=no_tracks_embed)
                     return
                 
-                # Update user statistics
+                # Update user statistics and metrics
                 self.bot.user_stats[user_id] += 1
+                self.bot.performance_metrics['cache_hits'] += 1
+                
+                # Calculate response time
+                response_time = time.time() - start_time
+                self.bot.request_times.append(response_time)
+                
+                # Update average response time
+                if self.bot.request_times:
+                    self.bot.performance_metrics['avg_response_time'] = sum(self.bot.request_times) / len(self.bot.request_times)
                 
                 # Format and send recommendations
-                response_embed = self._format_enhanced_recommendations(tracks, keywords)
+                response_embed = self._format_enhanced_recommendations(tracks, keywords, response_time)
                 await message.reply(embed=response_embed)
                 
-                logger.info(f"Successfully sent recommendations to user {user_id}")
+                logger.info(f"Successfully sent recommendations to user {user_id} in {response_time:.2f}s")
                 
             except Exception as e:
+                self.bot.performance_metrics['api_errors'] += 1
                 logger.error(f"Error processing message for user {user_id}: {str(e)}")
                 error_embed = discord.Embed(
                     title="😞 Sorry, I encountered an error while processing your request.",
@@ -236,9 +292,12 @@ class MusicCommands(commands.Cog):
                     color=discord.Color.red()
                 )
                 await message.reply(embed=error_embed)
+            finally:
+                # Remove user from processing set
+                self.processing_users.discard(user_id)
     
-    def _format_enhanced_recommendations(self, tracks: List, keywords: List[str]) -> discord.Embed:
-        """Format track recommendations with enhanced information."""
+    def _format_enhanced_recommendations(self, tracks: List, keywords: List[str], response_time: float = 0.0) -> discord.Embed:
+        """Format track recommendations with enhanced information and performance metrics."""
         keywords_text = ', '.join(keywords)
         
         embed = discord.Embed(
@@ -269,7 +328,10 @@ class MusicCommands(commands.Cog):
                 inline=False
             )
         
-        embed.set_footer(text="🎶 Enjoy your music! 💡 Tip: Use !stats to check your usage")
+        footer_text = "🎶 Enjoy your music! 💡 Tip: Use !stats to check your usage"
+        if response_time > 0:
+            footer_text += f" | ⚡ Response time: {response_time:.2f}s"
+        embed.set_footer(text=footer_text)
         
         return embed
 
